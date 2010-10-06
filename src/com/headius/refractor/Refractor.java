@@ -52,25 +52,96 @@ public class Refractor {
                 }
             }
         });
-        if (DEBUG) System.out.println(Arrays.toString(classes));
+        if (DEBUG) {
+            System.out.println("For classes:");
+            for (Class javaClass : classes) {
+                System.out.println("\t" + javaClass.getName());
+            }
+        }
 
-        Map<Method, Method> overrides = new HashMap<Method, Method>();
-        Method[] methods = getMethods(classes, overrides);
+        Map<Method, Set<Method>> overrideTable = new HashMap();
+        Method[] methods = getMethods(classes, overrideTable);
 
         if (DEBUG) {
+            System.out.println("\nReduced set of methods:");
             for (Method method : methods) {
-                System.out.println(method);
+                System.out.println("\t" + method);
             }
 
-            for (Map.Entry<Method, Method> entry : overrides.entrySet()) {
-                System.out.println("replaced " + entry.getKey() + "\n\twith " + entry.getValue());
+            System.out.println("\nOverrides:");
+            for (Map.Entry<Method, Set<Method>> entry : overrideTable.entrySet()) {
+                System.out.println("\tfor: " + entry.getKey());
+                for (Method override : entry.getValue()) {
+                    System.out.println("\t\t" + override);
+                }
+            }
+        }
+
+        // For all methods, build a mapping from arity to invocation logic, with
+        // casts in appropriate places. Store with increasing indices.
+        Map<Integer, List<String>> table = new HashMap();
+        Map<Class, List<Integer[]>> classJumps = new HashMap();
+        for (Method method : methods) {
+            Class<?>[] params = method.getParameterTypes();
+            int arity = params.length;
+
+            List<String> jumps = table.get(arity);
+            if (jumps == null) table.put(arity, jumps = new ArrayList());
+
+            // add invocation string to jump table
+            String paramString = "";
+            if (arity > 0) {
+                StringBuilder paramBuilder = new StringBuilder();
+                boolean first = true;
+                int index = 0;
+                for (Class<?> paramClass : params) {
+                    if (!first) paramBuilder.append(',');
+                    first = false;
+                    paramBuilder.append("(").append(paramClass.getName()).append(")arg").append(index++);
+                }
+                paramString = paramBuilder.toString();
+            }
+            if (method.getReturnType() == void.class) {
+                jumps.add("((" + method.getDeclaringClass().getName() + ")recv)." + method.getName() + "(" + paramString + "); return null;");
+            } else {
+                jumps.add("return ((" + method.getDeclaringClass().getName() + ")recv)." + method.getName() + "(" + paramString + ");");
+            }
+
+            // add jump offset and arity to classJumps table
+            List<Integer[]> offsetsArities = classJumps.get(method.getDeclaringClass());
+            if (offsetsArities == null) classJumps.put(method.getDeclaringClass(), offsetsArities = new ArrayList());
+            offsetsArities.add(new Integer[] {arity, jumps.size() - 1});
+
+            // add same offset and arity for all overrides of this method
+            Set<Method> overrides = overrideTable.get(method);
+            if (overrides != null) for (Method override : overrides) {
+                offsetsArities = classJumps.get(override.getDeclaringClass());
+                if (offsetsArities == null) classJumps.put(override.getDeclaringClass(), offsetsArities = new ArrayList());
+                offsetsArities.add(new Integer[] {arity, jumps.size() - 1});
+            }
+        }
+
+        if (DEBUG) {
+            System.out.println("\nInvocation table:");
+            for (Map.Entry<Integer, List<String>> entry : table.entrySet()) {
+                System.out.println("\t" + entry.getKey() + ":");
+                for (String invocation : entry.getValue()) {
+                    System.out.println("\t\t" + invocation);
+                }
+            }
+            System.out.println("\nClass table:");
+            for (Map.Entry<Class, List<Integer[]>> entry : classJumps.entrySet()) {
+                System.out.println("\t" + entry.getKey().getName() + ":");
+                for (Integer[] ints : entry.getValue()) {
+                    System.out.println("\t\t" + Arrays.toString(ints));
+                }
             }
         }
 
         return;
     }
 
-    private static Method[] getMethods(Class<?>[] javaClasses, Map<Method, Method> overrides) {
+    private static Method[] getMethods(Class<?>[] javaClasses, Map<Method, Set<Method>> overrides) {
         HashMap<String, List<Method>> nameMethods = new HashMap<String, List<Method>>();
 
         for (Class javaClass : javaClasses) {
@@ -116,7 +187,7 @@ public class Refractor {
                 && Modifier.isStatic(child.getModifiers()) == Modifier.isStatic(parent.getModifiers());
     }
 
-    private static void addNewMethods(HashMap<String, List<Method>> nameMethods, Map<Method, Method> overrides, Method[] methods, boolean includeStatic, boolean removeDuplicate) {
+    private static void addNewMethods(HashMap<String, List<Method>> nameMethods, Map<Method, Set<Method>> overrideTable, Method[] methods, boolean includeStatic, boolean removeDuplicate) {
         Methods: for (Method m : methods) {
             if (Modifier.isStatic(m.getModifiers()) && !includeStatic) {
                 // Skip static methods if we're not suppose to include them.
@@ -124,28 +195,32 @@ public class Refractor {
                 // class.
                 continue;
             }
-            List<Method> childMethods = nameMethods.get(m.getName());
-            if (childMethods == null) {
+            List<Method> parentMethods = nameMethods.get(m.getName());
+            if (parentMethods == null) {
                 // first method of this name, add a collection for it
-                childMethods = new ArrayList<Method>();
-                childMethods.add(m);
-                nameMethods.put(m.getName(), childMethods);
+                parentMethods = new ArrayList<Method>();
+                parentMethods.add(m);
+                nameMethods.put(m.getName(), parentMethods);
             } else {
                 // we have seen other methods; check if we already have
                 // an equivalent one
-                for (Method m2 : childMethods) {
+                for (Method m2 : parentMethods) {
                     if (methodsAreEquivalent(m, m2)) {
                         // just skip the new method, since we don't need it (already found one)
                         // used for interface methods, which we want to add unconditionally
                         // but only if we need them
 
-                        // add to override map, so we don't lose track of it entirely
-                        if (m.getDeclaringClass() != m2.getDeclaringClass()) overrides.put(m, m2);
+                        if (!m.toString().equals(m2.toString())) {
+                            // add to override map, so we don't lose track of it entirely
+                            Set<Method> overrides = overrideTable.get(m2);
+                            if (overrides == null) overrideTable.put(m2, overrides = new HashSet());
+                            overrides.add(m);
+                        }
                         continue Methods;
                     }
                 }
                 // no equivalent; add it
-                childMethods.add(m);
+                parentMethods.add(m);
             }
         }
     }
